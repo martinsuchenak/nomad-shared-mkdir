@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# set -u to error by name if an env var is not set
+set -eu
+
+# echo to stderr, because Nomad expects stdout to match the spec.
+# this (and stdout) show up in Nomad agent debug logs.
+stderr() {
+    >&2 echo "$@"
+}
+
+get_path() {
+    # since delete runs `rm -rf` (frightening), check to make sure
+    # the path is something sensible.
+    if [ -z "${DHV_VOLUMES_DIR:-}" ]; then
+        stderr "DHV_VOLUMES_DIR must not be empty"
+        exit 1
+    fi
+    if [ -z "${DHV_VOLUME_ID:-}" ]; then
+        stderr "DHV_VOLUME_ID must not be empty"
+        exit 1
+    fi
+    echo "$DHV_VOLUMES_DIR/$DHV_VOLUME_ID"
+}
+
+case "$1" in
+"fingerprint")
+    echo '{"version": "0.0.1"}'
+    ;;
+"create")
+    path="$(get_path)"
+    stderr "creating directory: $path"
+    
+    # `mkdir -p` may be run repeatedly with the same result;
+    # it is idempotent.
+    mkdir -p "$path"
+    chmod 777 "$path"
+    
+    # Spawn auto-registration for all other ready nomad nodes in the background
+    (
+        LOG_FILE="/tmp/auto-mkdir-${DHV_VOLUME_ID}.log"
+        echo "Starting auto-registration background loop..." > "$LOG_FILE"
+        
+        # Wait a few seconds to let Nomad finalize registration on the current node
+        sleep 5
+        
+        # Determine the name of the plugin automatically (usually the script name)
+        PLUGIN_NAME=$(basename "$0")
+
+        # Get all node IDs that are in 'ready' state
+        NODES=$(nomad node status -t '{{range .}}{{if eq .Status "ready"}}{{.ID}} {{end}}{{end}}' 2>>"$LOG_FILE" || true)
+        echo "Ready nodes found: $NODES" >> "$LOG_FILE"
+        
+        for node in $NODES; do
+            if [ "$node" != "$DHV_NODE_ID" ]; then
+                echo "Attempting to register on $node" >> "$LOG_FILE"
+                TEMP_HCL="/tmp/nomad-reg-${DHV_VOLUME_ID}-${node}.hcl"
+                
+                # Including default capabilities as Nomad requires them for registration
+                cat <<HCL > "$TEMP_HCL"
+type = "host"
+name = "${DHV_VOLUME_NAME}"
+plugin_id = "${PLUGIN_NAME}"
+node_id = "${node}"
+host_path = "${path}"
+
+capability {
+  access_mode     = "single-node-single-writer"
+  attachment_mode = "file-system"
+}
+capability {
+  access_mode     = "single-node-writer"
+  attachment_mode = "file-system"
+}
+capability {
+  access_mode     = "single-node-reader-only"
+  attachment_mode = "file-system"
+}
+HCL
+
+                # Try to register, logging output
+                nomad volume register "$TEMP_HCL" >> "$LOG_FILE" 2>&1 || true
+                rm -f "$TEMP_HCL"
+            fi
+        done
+        echo "Done auto-registration" >> "$LOG_FILE"
+    ) & disown
+
+    # 0 bytes because plain directories are not any particular size.
+    printf '{"path": "%s", "bytes": 0}' "$path"
+    ;;
+"delete")
+    path="$(get_path)"
+    GLOBAL_LOCK="${DHV_VOLUMES_DIR}/.nomad_del_${DHV_VOLUME_NAME}.lock"
+    if [ -f "$GLOBAL_LOCK" ]; then
+        rm -rf "$path"
+        exit 0
+    fi
+    
+    touch "$GLOBAL_LOCK"
+    rm -rf "$path" # `rm -rf` is idempotent.
+
+    # Spawn auto-deregistration for all other nodes in the background cleanly decoupled
+    (
+        LOG_FILE="/tmp/auto-mkdir-delete-${DHV_VOLUME_ID}.log"
+        echo "Starting auto-deregistration background loop..." > "$LOG_FILE"
+        
+        # Get all volume IDs with the same name, gracefully ignoring generic CLI output strings
+        VOLS=$(nomad volume status -t '{{range .}}{{if eq .Name "'"${DHV_VOLUME_NAME}"'"}}{{.ID}} {{end}}{{end}}' 2>/dev/null | grep -v "No CSI volumes" || true)
+        echo "Found related volumes: $VOLS" >> "$LOG_FILE"
+        
+        for v_id in $VOLS; do
+            # We skip the main DHCP_VOLUME_ID since Nomad is actively deleting it right now
+            if [ "$v_id" != "$DHV_VOLUME_ID" ] && [ -n "$v_id" ]; then
+                echo "Deregistering $v_id" >> "$LOG_FILE"
+                nomad volume delete -type=host "$v_id" >> "$LOG_FILE" 2>&1 || true
+            fi
+        done
+        
+        rm -f "$GLOBAL_LOCK"
+        echo "Done auto-deregistration" >> "$LOG_FILE"
+    ) </dev/null >/dev/null 2>&1 & disown
+    ;;
+*)
+    echo "unknown operation: '$1'"
+    exit 1
+    ;;
+esac
