@@ -35,3 +35,5 @@ name      = "my-distributed-database"
 type      = "host"
 plugin_id = "nomad-shared-mkdir"
 ```
+
+License [MIT](LICENSE)
