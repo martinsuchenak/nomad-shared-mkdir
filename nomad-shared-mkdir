@@ -22,39 +22,169 @@ get_path() {
     echo "$DHV_VOLUMES_DIR/$DHV_VOLUME_ID"
 }
 
+sync_missing_volumes() {
+    LOG_FILE="/tmp/nomad-shared-mkdir-sync.log"
+    MARKER_FILE="/tmp/nomad-shared-mkdir-sync.marker"
+
+    # Build an identifier that changes on reboot or on a Nomad service
+    # restart, so the sync runs once per agent lifetime instead of on every
+    # fingerprint call. The boot_id covers reboots; the Nomad agent's PID and
+    # start time cover a plain service restart (it gets a fresh process).
+    BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+    NOMAD_PID=$(pgrep -o -x nomad 2>/dev/null || true)
+    NOMAD_START=$(ps -o lstart= -p "${NOMAD_PID:-0}" 2>/dev/null | tr -s ' ' '_' | tr -d '\n' || true)
+    RUN_ID="${BOOT_ID}|${NOMAD_PID}|${NOMAD_START}"
+
+    # Already synced for this boot/agent lifetime? Then there's nothing to do.
+    if [ -f "$MARKER_FILE" ] && [ "$(cat "$MARKER_FILE" 2>/dev/null || true)" = "$RUN_ID" ]; then
+        return 0
+    fi
+
+    (
+        # Use a lock to ensure only one sync runs at a time
+        exec 200>/tmp/nomad-shared-mkdir-sync.lock
+        if ! flock -n 200; then
+            exit 0
+        fi
+
+        # Re-check inside the lock in case another run finished while we waited.
+        if [ -f "$MARKER_FILE" ] && [ "$(cat "$MARKER_FILE" 2>/dev/null || true)" = "$RUN_ID" ]; then
+            exit 0
+        fi
+
+        # Rotate the log if it has grown past 1 MB, keeping one previous copy.
+        if [ -f "$LOG_FILE" ] && [ "$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+            mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+        fi
+
+        echo "$(date) - Starting background sync of missing volumes..." >> "$LOG_FILE"
+
+        # Wait until the node is ready in Nomad
+        sleep 10
+
+        # Determine local node ID
+        LOCAL_NODE_ID=$(nomad node status -self -t '{{.ID}}' 2>>"$LOG_FILE" || true)
+        if [ -z "$LOCAL_NODE_ID" ]; then
+            echo "$(date) - Could not determine local node ID. Aborting sync." >> "$LOG_FILE"
+            exit 1
+        fi
+
+        # Wait a bit longer to ensure the client is fully registered
+        sleep 5
+
+        echo "$(date) - Local node ID: $LOCAL_NODE_ID" >> "$LOG_FILE"
+
+        PLUGIN_NAME=$(basename "$0")
+
+        # Get all volume names for this plugin
+        NAME_TEMPLATE='{{range .}}{{if eq .PluginID "'"$PLUGIN_NAME"'"}}{{.Name}}
+{{end}}{{end}}'
+        VOLUME_NAMES=$(nomad volume status -type host -t "$NAME_TEMPLATE" 2>>"$LOG_FILE" | sed '/^[[:space:]]*$/d' | sort -u || true)
+
+        if [ -z "$VOLUME_NAMES" ]; then
+            echo "$(date) - No volumes found with plugin_id = $PLUGIN_NAME" >> "$LOG_FILE"
+            echo "$RUN_ID" > "$MARKER_FILE"
+            exit 0
+        fi
+
+        while IFS= read -r VOL_NAME; do
+            [ -z "$VOL_NAME" ] && continue
+
+            # Check if already registered on the local node
+            ALREADY_TEMPLATE='{{range .}}{{if and (eq .PluginID "'"$PLUGIN_NAME"'") (eq .Name "'"$VOL_NAME"'") (eq .NodeID "'"$LOCAL_NODE_ID"'")}}{{.ID}}{{end}}{{end}}'
+            ALREADY=$(nomad volume status -type host -t "$ALREADY_TEMPLATE" 2>>"$LOG_FILE" | tr -d ' \n' || true)
+
+            if [ -n "$ALREADY" ]; then
+                continue
+            fi
+
+            echo "$(date) - Volume $VOL_NAME is missing on $LOCAL_NODE_ID. Looking for a reference..." >> "$LOG_FILE"
+
+            REF_TEMPLATE='{{range .}}{{if and (eq .PluginID "'"$PLUGIN_NAME"'") (eq .Name "'"$VOL_NAME"'")}}{{.ID}}
+{{end}}{{end}}'
+            REF_VOL_ID=$(nomad volume status -type host -t "$REF_TEMPLATE" 2>>"$LOG_FILE" | sed '/^[[:space:]]*$/d' | head -1 || true)
+
+            if [ -z "$REF_VOL_ID" ]; then
+                continue
+            fi
+
+            HOST_PATH=$(nomad volume status "$REF_VOL_ID" 2>>"$LOG_FILE" \
+                | grep -i "Host Path" | awk -F' = ' '{print $2}' | xargs || true)
+
+            if [ -z "$HOST_PATH" ]; then
+                echo "$(date) - Could not determine host path for $VOL_NAME. Skipping." >> "$LOG_FILE"
+                continue
+            fi
+
+            echo "$(date) - Registering $VOL_NAME with host_path $HOST_PATH..." >> "$LOG_FILE"
+
+            TMP_HCL=$(mktemp /tmp/nomad-reg-XXXXXX.hcl)
+            cat > "$TMP_HCL" <<EOF
+name      = "${VOL_NAME}"
+type      = "host"
+plugin_id = "${PLUGIN_NAME}"
+node_id   = "${LOCAL_NODE_ID}"
+host_path = "${HOST_PATH}"
+
+capability {
+  access_mode     = "single-node-single-writer"
+  attachment_mode = "file-system"
+}
+capability {
+  access_mode     = "single-node-writer"
+  attachment_mode = "file-system"
+}
+capability {
+  access_mode     = "single-node-reader-only"
+  attachment_mode = "file-system"
+}
+EOF
+            nomad volume register "$TMP_HCL" >> "$LOG_FILE" 2>&1 || true
+            rm -f "$TMP_HCL"
+        done <<< "$VOLUME_NAMES"
+
+        echo "$(date) - Background sync completed." >> "$LOG_FILE"
+
+        # Record that we've synced for this boot/agent lifetime so subsequent
+        # fingerprint calls become no-ops until the next reboot/restart.
+        echo "$RUN_ID" > "$MARKER_FILE"
+    ) </dev/null >/dev/null 2>&1 & disown
+}
+
 case "$1" in
 "fingerprint")
     echo '{"version": "0.0.1"}'
+    sync_missing_volumes
     ;;
 "create")
     path="$(get_path)"
     stderr "creating directory: $path"
-    
+
     # `mkdir -p` may be run repeatedly with the same result;
     # it is idempotent.
     mkdir -p "$path"
     chmod 777 "$path"
-    
+
     # Spawn auto-registration for all other ready nomad nodes in the background
     (
         LOG_FILE="/tmp/auto-mkdir-${DHV_VOLUME_ID}.log"
         echo "Starting auto-registration background loop..." > "$LOG_FILE"
-        
+
         # Wait a few seconds to let Nomad finalize registration on the current node
         sleep 5
-        
+
         # Determine the name of the plugin automatically (usually the script name)
         PLUGIN_NAME=$(basename "$0")
 
         # Get all node IDs that are in 'ready' state
         NODES=$(nomad node status -t '{{range .}}{{if eq .Status "ready"}}{{.ID}} {{end}}{{end}}' 2>>"$LOG_FILE" || true)
         echo "Ready nodes found: $NODES" >> "$LOG_FILE"
-        
+
         for node in $NODES; do
             if [ "$node" != "$DHV_NODE_ID" ]; then
                 echo "Attempting to register on $node" >> "$LOG_FILE"
                 TEMP_HCL="/tmp/nomad-reg-${DHV_VOLUME_ID}-${node}.hcl"
-                
+
                 # Including default capabilities as Nomad requires them for registration
                 cat <<HCL > "$TEMP_HCL"
 type = "host"
@@ -95,7 +225,7 @@ HCL
         rm -rf "$path"
         exit 0
     fi
-    
+
     touch "$GLOBAL_LOCK"
     rm -rf "$path" # `rm -rf` is idempotent.
 
@@ -103,11 +233,11 @@ HCL
     (
         LOG_FILE="/tmp/auto-mkdir-delete-${DHV_VOLUME_ID}.log"
         echo "Starting auto-deregistration background loop..." > "$LOG_FILE"
-        
+
         # Get all volume IDs with the same name, gracefully ignoring generic CLI output strings
         VOLS=$(nomad volume status -t '{{range .}}{{if eq .Name "'"${DHV_VOLUME_NAME}"'"}}{{.ID}} {{end}}{{end}}' 2>/dev/null | grep -v "No CSI volumes" || true)
         echo "Found related volumes: $VOLS" >> "$LOG_FILE"
-        
+
         for v_id in $VOLS; do
             # We skip the main DHCP_VOLUME_ID since Nomad is actively deleting it right now
             if [ "$v_id" != "$DHV_VOLUME_ID" ] && [ -n "$v_id" ]; then
@@ -115,7 +245,7 @@ HCL
                 nomad volume delete -type=host "$v_id" >> "$LOG_FILE" 2>&1 || true
             fi
         done
-        
+
         rm -f "$GLOBAL_LOCK"
         echo "Done auto-deregistration" >> "$LOG_FILE"
     ) </dev/null >/dev/null 2>&1 & disown
